@@ -1,6 +1,6 @@
 package org.gradle.script.lang.kotlin.accessors
 
-import org.gradle.script.lang.kotlin.integration.AbstractIntegrationTest
+import org.gradle.script.lang.kotlin.fixtures.AbstractIntegrationTest
 import org.gradle.script.lang.kotlin.integration.canonicalClassPathFor
 
 import org.hamcrest.CoreMatchers.*

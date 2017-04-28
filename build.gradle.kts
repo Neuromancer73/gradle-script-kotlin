@@ -9,11 +9,14 @@ import org.gradle.api.internal.HasConvention
 import org.gradle.api.publish.maven.*
 import org.gradle.api.tasks.Copy
 import org.gradle.api.tasks.GradleBuild
+import org.gradle.api.tasks.SourceSet
+import org.gradle.api.tasks.testing.Test
 import org.gradle.jvm.tasks.Jar
 
 import org.jetbrains.kotlin.gradle.dsl.Coroutines
 import org.jetbrains.kotlin.gradle.dsl.KotlinProjectExtension
 import org.jetbrains.kotlin.gradle.plugin.KotlinSourceSet
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 import org.jfrog.gradle.plugin.artifactory.dsl.PublisherConfig
 import org.jfrog.gradle.plugin.artifactory.dsl.ResolverConfig
@@ -55,12 +58,6 @@ dependencies {
     compile(kotlin("stdlib"))
     compile(kotlin("reflect"))
     compile(kotlin("compiler-embeddable"))
-
-    testCompile(gradleTestKit())
-    testCompile("junit:junit:4.12")
-    testCompile("com.nhaarman:mockito-kotlin:1.2.0")
-    testCompile("com.fasterxml.jackson.module:jackson-module-kotlin:2.7.5")
-    testCompile("org.ow2.asm:asm-all:5.1")
 }
 
 configure<KotlinProjectExtension> {
@@ -94,7 +91,6 @@ val generateConfigurationExtensions by task<GenerateConfigurationExtensions> {
 }
 
 val kotlinVersion: String by extra
-
 val kotlinRepo: String by extra
 
 val generateKotlinDependencyExtensions by task<GenerateKotlinDependencyExtensions> {
@@ -115,12 +111,35 @@ compileKotlin.dependsOn(generateExtensions)
     kotlin.srcDir(apiExtensionsOutputDir)
 }
 
-// -- Performance testing ----------------------------------------------
-//
-// 1. Creates a custom Gradle installation with latest gradle-script-kotlin jar
-//
-// 2. Benchmarks latest installation against configured wrapper
-//
+// -- Testing ----------------------------------------------------------
+val check by tasks
+
+
+// -- Test fixtures ----------------------------------------------------
+val fixturesSourceSet = sourceSets.create("fixtures") {
+    compileClasspath += mainSourceSet.output
+    runtimeClasspath += mainSourceSet.output
+    java.srcDirs()
+    (this as HasConvention).convention.getPlugin<KotlinSourceSet>().apply {
+        kotlin.srcDirs("src/fixtures/kotlin")
+    }
+}
+val fixturesCompile by configurations
+fixturesCompile.extendsFrom(configurations.compile)
+val fixturesRuntime by configurations
+fixturesRuntime.extendsFrom(configurations.runtime)
+dependencies {
+    fixturesCompile(gradleTestKit())
+    fixturesCompile("junit:junit:4.12")
+    fixturesCompile("com.nhaarman:mockito-kotlin:1.2.0")
+    fixturesCompile("com.fasterxml.jackson.module:jackson-module-kotlin:2.7.5")
+    fixturesCompile("org.ow2.asm:asm-all:5.1")
+}
+
+val prepareIntegrationTestFixtures by task<GradleBuild> {
+    dir = file("fixtures")
+}
+
 val customInstallationDir = file("$buildDir/custom/gradle-${gradle.gradleVersion}")
 
 val copyCurrentDistro by task<Copy> {
@@ -152,55 +171,52 @@ val customInstallation by task<Copy> {
     into("$customInstallationDir/lib")
 }
 
+fun configureForTesting(sourceSet: SourceSet): SourceSet
+{
+    configurations["${sourceSet.name}Compile"].extendsFrom(fixturesCompile)
+    configurations["${sourceSet.name}Runtime"].extendsFrom(configurations.runtime)
+    sourceSet.run {
+        compileClasspath += mainSourceSet.output + fixturesSourceSet.output
+        runtimeClasspath += mainSourceSet.output + fixturesSourceSet.output
+        (this as HasConvention).convention.getPlugin<KotlinSourceSet>().apply {
+            kotlin.srcDirs("src/${sourceSet.name}/kotlin")
+        }
+    }
+    // Workaround for https://youtrack.jetbrains.com/issue/KT-17630
+    // Unfortunately it doesn't work in IDEA
+    val kotlinCompileTask = tasks.getByName("compile${sourceSet.name.capitalize()}Kotlin") as KotlinCompile
+    KotlinCompile::class.java.getMethod("setFriendTaskName\$kotlin_gradle_plugin", String::class.java).run {
+        invoke(kotlinCompileTask, "compileKotlin")
+    }
+    return sourceSet
+}
+
+fun createTestTaskFor(sourceSet: SourceSet): Test =
+    tasks.create(sourceSet.name, Test::class.java).apply {
+        classpath = sourceSet.runtimeClasspath
+        testClassesDir = sourceSet.output.classesDir
+    }
+
+
+// -- Unit testing ----------------------------------------------------
+configureForTesting(sourceSets["test"])
 val test by tasks
+test.dependsOn(prepareIntegrationTestFixtures)
 test.dependsOn(customInstallation)
 
-val benchmark by task<integration.Benchmark> {
+
+// -- Samples testing --------------------------------------------------
+val samplesTestSourceSet = configureForTesting(sourceSets.create("samplesTest"))
+val samplesTest = createTestTaskFor(samplesTestSourceSet)
+samplesTest.dependsOn(customInstallation)
+check.dependsOn(samplesTest)
+
+
+// -- Performance testing ----------------------------------------------
+val benchmark by tasks.creating(integration.Benchmark::class) {
     dependsOn(customInstallation)
     latestInstallation = customInstallationDir
 }
-
-val isCI by lazy {
-    !System.getenv("CI").isNullOrEmpty()
-}
-
-// -- Integration testing ---------------------------------------------
-//
-// Checks a single sample, for instance:
-//
-//     check-hello-kotlin
-//
-tasks.addRule("Pattern: check-<SAMPLE>") {
-    val taskName = this
-    if (taskName.startsWith("check-")) {
-        val checkSample = task<integration.CheckSample>("$taskName-task") {
-            dependsOn(customInstallation)
-            installation = customInstallationDir
-            sampleDir = file("samples/${taskName.removePrefix("check-")}")
-            if (isCI) {
-                additionalGradleArguments = listOf("-d", "-Dkotlin-daemon.verbose=true")
-            }
-        }
-        task(taskName).dependsOn(checkSample)
-    }
-}
-
-val checkSamples by tasks.creating {
-    description = "Checks all samples"
-    file("samples").listFiles().forEach {
-        if (it.isDirectory && !it.name.contains("android")) {
-            dependsOn("check-${it.name}")
-        }
-    }
-}
-
-val check by tasks
-check.dependsOn(checkSamples)
-
-val prepareIntegrationTestFixtures by task<GradleBuild> {
-    dir = file("fixtures")
-}
-test.dependsOn(prepareIntegrationTestFixtures)
 
 
 // --- classpath.properties --------------------------------------------
